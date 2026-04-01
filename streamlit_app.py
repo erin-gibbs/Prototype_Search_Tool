@@ -18,7 +18,7 @@ all_sources = st.sidebar.checkbox("All Sources", value=True)
 sources = {
     "Amendment 50 & CRS": "PDFs/updatedLGact.pdf",
     "CLGR": "PDFs/1CCR207-1CombinedRules31726.pdf",
-    "ICMP": "PDFs/CombinedICMPEffectiveApril1%2C2026_0.pdf"
+    "ICMP": "CombinedICMPEffectiveApril12026.pdf"
 }
 
 selected_paths = []
