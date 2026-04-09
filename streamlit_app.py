@@ -9,7 +9,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 PDF_MAP = {
     "Amendment 50 & CRS": "PDFs/updatedLGact.pdf",
     "CLGR": "PDFs/1CCR207-1CombinedRules31726.pdf",
-    "ICMP": "PDFs/CombinedICMPEffectiveApril12C2026.pdf",
+    "ICMP": "PDFs/CombinedICMPEffectiveApril12026.pdf",
     "Notification": "PDFs/NotificationRequirementsDocApril12026.pdf"
 }
 LOGO_PATH = "PDFs/DOGLogo.jpg"
