@@ -20,11 +20,11 @@ from sklearn.metrics.pairwise import cosine_similarity
 # =========================================================
 APP_DIR = Path(__file__).resolve().parent
 PDF_DIR = APP_DIR / "PDFs"
-IMAGE_DIR = APP_DIR / "image"
+IMAGE_DIR = APP_DIR / "Image"
 
 STATIC_DIR = APP_DIR / "static"
 STATIC_PDF_DIR = STATIC_DIR / "PDFs"
-STATIC_IMAGE_DIR = STATIC_DIR / "image"
+STATIC_IMAGE_DIR = STATIC_DIR / "Image"
 
 # =========================================================
 # CONFIG
@@ -49,7 +49,7 @@ VISIBLE_SOURCES: Dict[str, Dict[str, str]] = {
         "label": "CLGR",
     },
     "ICMP": {
-        "filename": "CombinedICMPEffectiveApril12C2026.pdf",
+        "filename": "CombinedICMPEffectiveApril12026.pdf",
         "label": "ICMP",
     },
 }
@@ -822,7 +822,7 @@ def main() -> None:
     required_files = [
         PDF_DIR / "updatedLGact.pdf",
         PDF_DIR / "1CCR207-1CombinedRules31726.pdf",
-        PDF_DIR / "CombinedICMPEffectiveApril12C2026.pdf",
+        PDF_DIR / "CombinedICMPEffectiveApril12026.pdf",
         PDF_DIR / "NotificationRequirementsDocApril12026.pdf",
         IMAGE_DIR / "DOGLogo.jpg",
     ]
