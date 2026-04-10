@@ -1,198 +1,685 @@
-import streamlit as st
-import fitz  # PyMuPDF
-import base64
+import html
 import re
+import shutil
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple
+from urllib.parse import quote
+
+import fitz  # PyMuPDF
+import numpy as np
+import streamlit as st
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# --- CONFIGURATION & PATHS ---
-PDF_MAP = {
-    "Amendment 50 & CRS": "PDFs/updatedLGact.pdf",
-    "CLGR": "PDFs/1CCR207-1CombinedRules31726.pdf",
-    "ICMP": "PDFs/CombinedICMPEffectiveApril12026.pdf",
-    "Notification": "PDFs/NotificationRequirementsDocApril12026.pdf"
+# =========================================================
+# PATHS
+# =========================================================
+APP_DIR = Path(__file__).resolve().parent
+PDF_DIR = APP_DIR / "PDFs"
+IMAGE_DIR = APP_DIR / "image"
+
+STATIC_DIR = APP_DIR / "static"
+STATIC_PDF_DIR = STATIC_DIR / "PDFs"
+STATIC_IMAGE_DIR = STATIC_DIR / "image"
+
+# =========================================================
+# CONFIG
+# =========================================================
+st.set_page_config(
+    page_title="Colorado Gaming Regulatory Search",
+    layout="wide",
+)
+
+RED = "#B3191F"
+LIGHT_RED = "#F8DDDF"
+TEXT = "#1F1F1F"
+BORDER = "#D9D9D9"
+
+VISIBLE_SOURCES: Dict[str, Dict[str, str]] = {
+    "Amendment 50 & CRS": {
+        "filename": "updatedLGact.pdf",
+        "label": "Amendment 50 & CRS",
+    },
+    "CLGR": {
+        "filename": "1CCR207-1CombinedRules31726.pdf",
+        "label": "CLGR",
+    },
+    "ICMP": {
+        "filename": "CombinedICMPEffectiveApril12C2026.pdf",
+        "label": "ICMP",
+    },
 }
-LOGO_PATH = "PDFs/DOGLogo.jpg"
 
-# --- UI STYLING: RED THEME ---
-st.set_page_config(page_title="Colorado Gaming Search", layout="wide")
+ALWAYS_INCLUDED_SOURCE = {
+    "key": "Notification",
+    "filename": "NotificationRequirementsDocApril12026.pdf",
+    "label": "Notification",
+}
 
-# Custom CSS for Red Banner, Centered Text, and Red Checkmarks
-st.markdown("""
-    <style>
-    .red-banner {
-        background-color: #C8102E;
-        padding: 15px;
-        border-radius: 5px;
-        text-align: center;
-        margin-bottom: 20px;
+LOGO_FILENAME = "DOGLogo.jpg"
+
+# =========================================================
+# DATA MODEL
+# =========================================================
+@dataclass(frozen=True)
+class PageRecord:
+    source_key: str
+    source_label: str
+    filename: str
+    page_number: int  # 1-based
+    text: str
+    normalized_text: str
+    static_pdf_path: str
+
+
+# =========================================================
+# UTILS
+# =========================================================
+def normalize_text(text: str) -> str:
+    text = text.replace("\u00a0", " ")
+    text = re.sub(r"\s+", " ", text or "")
+    return text.strip()
+
+
+def tokenize(text: str) -> List[str]:
+    return re.findall(r"[A-Za-z0-9&\-/]+", text.lower())
+
+
+def parse_query(query: str) -> Tuple[str, List[str]]:
+    quoted_phrases = re.findall(r'"([^"]+)"', query)
+    cleaned = re.sub(r'"([^"]+)"', " ", query)
+    cleaned = normalize_text(cleaned)
+    quoted_phrases = [normalize_text(p) for p in quoted_phrases if normalize_text(p)]
+    return cleaned, quoted_phrases
+
+
+def ensure_static_assets() -> None:
+    STATIC_PDF_DIR.mkdir(parents=True, exist_ok=True)
+    STATIC_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Copy PDFs to Streamlit static directory for clickable links
+    for source in list(VISIBLE_SOURCES.values()) + [ALWAYS_INCLUDED_SOURCE]:
+        src = PDF_DIR / source["filename"]
+        dst = STATIC_PDF_DIR / source["filename"]
+        if src.exists():
+            if not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime:
+                shutil.copy2(src, dst)
+
+    # Copy logo
+    logo_src = IMAGE_DIR / LOGO_FILENAME
+    logo_dst = STATIC_IMAGE_DIR / LOGO_FILENAME
+    if logo_src.exists():
+        if not logo_dst.exists() or logo_src.stat().st_mtime > logo_dst.stat().st_mtime:
+            shutil.copy2(logo_src, logo_dst)
+
+
+def pdf_link(filename: str, page_number: int) -> str:
+    quoted_name = quote(filename)
+    return f"app/static/PDFs/{quoted_name}#page={page_number}"
+
+
+def image_link(filename: str) -> str:
+    quoted_name = quote(filename)
+    return f"app/static/image/{quoted_name}"
+
+
+def count_keyword_hits(text: str, terms: List[str]) -> int:
+    lowered = text.lower()
+    total = 0
+    for term in terms:
+        if not term.strip():
+            continue
+        total += len(re.findall(rf"\b{re.escape(term.lower())}\b", lowered))
+    return total
+
+
+def all_terms_present(text: str, terms: List[str]) -> bool:
+    if not terms:
+        return False
+    lowered = text.lower()
+    return all(term.lower() in lowered for term in terms if term.strip())
+
+
+def looks_like_heading_match(text: str, terms: List[str]) -> bool:
+    if not terms:
+        return False
+
+    # Look at the early lines/segments of the page where headings usually live
+    segments = re.split(r"(?<=[.:])\s+|\n", text[:1500])
+    early_segments = [seg.strip() for seg in segments[:10] if seg.strip()]
+
+    for seg in early_segments:
+        headingish = (
+            len(seg) <= 140
+            and (
+                seg.isupper()
+                or bool(re.match(r"^(rule|section|article|part|purpose|definitions|internal control|notification)", seg, re.I))
+                or bool(re.match(r"^\d+([.\-)]|\s)", seg))
+            )
+        )
+        if headingish and any(term.lower() in seg.lower() for term in terms):
+            return True
+    return False
+
+
+def make_raw_snippet(page_text: str, query_terms: List[str], phrases: List[str], window: int = 500) -> str:
+    search_items = [p for p in phrases if p] + [t for t in query_terms if t]
+    lowered = page_text.lower()
+
+    first_idx = -1
+    first_len = 0
+
+    for item in search_items:
+        idx = lowered.find(item.lower())
+        if idx != -1 and (first_idx == -1 or idx < first_idx):
+            first_idx = idx
+            first_len = len(item)
+
+    if first_idx == -1:
+        snippet = page_text[:window].strip()
+        if len(page_text) > window:
+            snippet += "..."
+        return snippet
+
+    start = max(0, first_idx - window // 2)
+    end = min(len(page_text), first_idx + first_len + window // 2)
+    snippet = page_text[start:end].strip()
+
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(page_text):
+        snippet = snippet + "..."
+
+    return snippet
+
+
+# =========================================================
+# PDF EXTRACTION
+# =========================================================
+@st.cache_data(show_spinner=False)
+def extract_pages_from_pdf(pdf_path: str, source_key: str, source_label: str) -> List[PageRecord]:
+    path = Path(pdf_path)
+    records: List[PageRecord] = []
+
+    if not path.exists():
+        return records
+
+    static_path = pdf_link(path.name, 1).split("#page=")[0]
+
+    with fitz.open(path) as doc:
+        for i, page in enumerate(doc, start=1):
+            # sort=True gives a more natural reading order
+            text = page.get_text("text", sort=True)
+            text = normalize_text(text)
+
+            if not text:
+                continue
+
+            records.append(
+                PageRecord(
+                    source_key=source_key,
+                    source_label=source_label,
+                    filename=path.name,
+                    page_number=i,
+                    text=text,
+                    normalized_text=text.lower(),
+                    static_pdf_path=static_path,
+                )
+            )
+
+    return records
+
+
+@st.cache_data(show_spinner=False)
+def build_page_index(selected_visible_sources: Tuple[str, ...]) -> List[PageRecord]:
+    records: List[PageRecord] = []
+
+    # Visible user-selected sources
+    for source_name in selected_visible_sources:
+        if source_name in VISIBLE_SOURCES:
+            meta = VISIBLE_SOURCES[source_name]
+            pdf_path = PDF_DIR / meta["filename"]
+            records.extend(
+                extract_pages_from_pdf(
+                    str(pdf_path),
+                    source_key=source_name,
+                    source_label=meta["label"],
+                )
+            )
+
+    # Always include notification doc, regardless of source selection
+    always_path = PDF_DIR / ALWAYS_INCLUDED_SOURCE["filename"]
+    records.extend(
+        extract_pages_from_pdf(
+            str(always_path),
+            source_key=ALWAYS_INCLUDED_SOURCE["key"],
+            source_label=ALWAYS_INCLUDED_SOURCE["label"],
+        )
+    )
+
+    return records
+
+
+# =========================================================
+# SEARCH / RANKING
+# =========================================================
+def search_pages(records: List[PageRecord], raw_query: str, top_k: int = 15) -> List[dict]:
+    cleaned_query, quoted_phrases = parse_query(raw_query)
+    query_terms = tokenize(cleaned_query)
+
+    if not records:
+        return []
+
+    if not cleaned_query and not quoted_phrases:
+        return []
+
+    vector_query = cleaned_query if cleaned_query else " ".join(quoted_phrases)
+    corpus = [r.text for r in records]
+
+    vectorizer = TfidfVectorizer(
+        lowercase=True,
+        stop_words="english",
+        ngram_range=(1, 2),
+        sublinear_tf=True,
+        min_df=1,
+    )
+
+    tfidf_matrix = vectorizer.fit_transform(corpus)
+    query_vector = vectorizer.transform([vector_query])
+    tfidf_scores = cosine_similarity(query_vector, tfidf_matrix).flatten()
+
+    results = []
+    for i, record in enumerate(records):
+        text = record.text
+        lowered = record.normalized_text
+
+        keyword_hits = count_keyword_hits(text, query_terms)
+        keyword_score = min(keyword_hits / 10.0, 1.0)
+
+        all_terms_bonus = 1.0 if all_terms_present(text, query_terms) else 0.0
+
+        quoted_phrase_hits = sum(lowered.count(p.lower()) for p in quoted_phrases)
+        full_query_phrase_hits = lowered.count(cleaned_query.lower()) if cleaned_query else 0
+        exact_phrase_bonus = min((quoted_phrase_hits * 1.5 + full_query_phrase_hits), 2.0) / 2.0
+
+        heading_bonus = 1.0 if looks_like_heading_match(text, query_terms or quoted_phrases) else 0.0
+
+        final_score = (
+            tfidf_scores[i] * 0.45
+            + keyword_score * 0.15
+            + all_terms_bonus * 0.10
+            + exact_phrase_bonus * 0.20
+            + heading_bonus * 0.10
+        )
+
+        if final_score <= 0:
+            continue
+
+        results.append(
+            {
+                "record": record,
+                "score": float(final_score),
+                "tfidf_score": float(tfidf_scores[i]),
+                "keyword_hits": keyword_hits,
+                "snippet": make_raw_snippet(text, query_terms, quoted_phrases),
+                "all_terms_bonus": all_terms_bonus,
+                "exact_phrase_bonus": exact_phrase_bonus,
+                "heading_bonus": heading_bonus,
+            }
+        )
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:top_k]
+
+
+def dedupe_results(results: List[dict], max_per_source: int = 5) -> List[dict]:
+    deduped = []
+    seen_pages = set()
+    per_source_counts: Dict[str, int] = {}
+
+    for item in results:
+        record = item["record"]
+        page_key = (record.filename, record.page_number)
+
+        if page_key in seen_pages:
+            continue
+
+        if per_source_counts.get(record.source_label, 0) >= max_per_source:
+            continue
+
+        seen_pages.add(page_key)
+        per_source_counts[record.source_label] = per_source_counts.get(record.source_label, 0) + 1
+        deduped.append(item)
+
+    return deduped
+
+
+# =========================================================
+# SUMMARY
+# =========================================================
+def build_plain_language_summary(results: List[dict], user_query: str) -> str:
+    if not results:
+        return "No relevant matches were found in the selected embedded PDF sources."
+
+    top_results = results[:5]
+    source_counts = Counter(item["record"].source_label for item in top_results)
+    source_summary = ", ".join(f"{src} ({count})" for src, count in source_counts.items())
+
+    top_points = []
+    for item in top_results[:3]:
+        rec = item["record"]
+        top_points.append(
+            f"{rec.source_label} page {rec.page_number} contains language that appears relevant to the search."
+        )
+
+    summary = (
+        f"Based on the selected Colorado Division of Gaming embedded PDF sources, "
+        f"the strongest matches for '{user_query}' appear in: {source_summary}. "
+        f"{' '.join(top_points)} "
+        f"Review the citation text below for the exact extracted language."
+    )
+    return summary
+
+
+# =========================================================
+# SESSION STATE / CHECKBOX LOGIC
+# =========================================================
+def initialize_session_state() -> None:
+    defaults = {
+        "all_sources": True,
+        "source_amendment": True,
+        "source_clgr": True,
+        "source_icmp": True,
     }
-    .banner-text {
-        color: white;
-        font-weight: bold;
-        font-size: 32px;
-        margin: 0;
-    }
-    /* Force Red Checkbox Marks */
-    input[type="checkbox"]:checked { background-color: #C8102E !important; }
-    .stCheckbox > label > div[data-testid="stMarker"] {
-        background-color: #C8102E !important;
-        border-color: #C8102E !important;
-    }
-    /* Red Search Button with white bold text */
-    div.stButton > button {
-        background-color: #C8102E;
-        color: white;
-        font-weight: bold;
-        width: 100%;
-        height: 3em;
-        border: none;
-    }
-    div.stButton > button:hover { background-color: #A00D25; color: white; }
-    </style>
-    """, unsafe_allow_html=True)
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-# --- ENGINE: PDF INDEXING & SEARCH ---
-class GamingSearchEngine:
-    def __init__(self):
-        self.docs = []
-        self.vectorizer = TfidfVectorizer(stop_words='english', ngram_range=(1, 2))
-        self.tfidf_matrix = None
 
-    def index_files(self):
-        """Extracts and chunks text from the 4 local PDFs."""
-        for label, path in PDF_MAP.items():
-            try:
-                doc = fitz.open(path)
-                for page_num in range(len(doc)):
-                    page = doc[page_num]
-                    text = page.get_text("text")
-                    
-                    # Split page into logical paragraphs for better relevance
-                    paragraphs = [p.strip() for p in text.split('\n\n') if len(p.strip()) > 50]
-                    for para in paragraphs:
-                        # Extract Reference IDs (e.g., 30-106 or SECTION 1)
-                        ref_match = re.search(r'(\d{2,}-\d{3,}|SECTION\s+\d+)', para, re.I)
-                        ref_id = ref_match.group(1) if ref_match else f"Page {page_num + 1}"
-                        
-                        self.docs.append({
-                            "content": para,
-                            "source": label,
-                            "path": path,
-                            "page": page_num + 1,
-                            "ref_id": ref_id
-                        })
-                doc.close()
-            except Exception as e:
-                st.error(f"Could not index {path}: {e}")
-        
-        if self.docs:
-            self.tfidf_matrix = self.vectorizer.fit_transform([d['content'] for d in self.docs])
+def sync_from_all() -> None:
+    checked = st.session_state["all_sources"]
+    st.session_state["source_amendment"] = checked
+    st.session_state["source_clgr"] = checked
+    st.session_state["source_icmp"] = checked
 
-    def search(self, query, active_filters):
-        """Perform TF-IDF search across indexed documents."""
-        if self.tfidf_matrix is None or not query:
-            return []
-            
-        query_vec = self.vectorizer.transform([query])
-        similarities = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
-        
-        # Filter indices by chosen sources and a minimum relevance threshold
-        top_indices = similarities.argsort()[-20:][::-1]
-        results = []
-        for idx in top_indices:
-            doc = self.docs[idx]
-            # Match internal metadata label with the UI checkbox label
-            if doc['source'] in active_filters and similarities[idx] > 0.02:
-                results.append(doc)
-        return results[:5]
 
-# --- UTILITY: BASE64 PDF EMBEDDER ---
-def get_pdf_tab_link(path, page_num):
-    """Encodes PDF as Base64 to open a local file in a new browser tab at a specific page."""
-    try:
-        with open(path, "rb") as f:
-            base64_pdf = base64.b64encode(f.read()).decode('utf-8')
-        # PDF parameter #page=X is native to browser viewers
-        pdf_data = f'data:application/pdf;base64,{base64_pdf}#page={page_num}'
-        return f'<a href="{pdf_data}" target="_blank" style="text-decoration:none;"><button style="background-color:#C8102E; color:white; border:none; padding:8px 16px; border-radius:5px; cursor:pointer; font-weight:bold;">View PDF (Page {page_num})</button></a>'
-    except:
-        return "Source file missing."
+def sync_from_individuals() -> None:
+    all_checked = (
+        st.session_state["source_amendment"]
+        and st.session_state["source_clgr"]
+        and st.session_state["source_icmp"]
+    )
+    st.session_state["all_sources"] = all_checked
 
-# --- INTERFACE LAYOUT ---
-# 1. Header Row
-col_logo, col_banner = st.columns([0.15, 0.85])
-with col_logo:
-    try: st.image(LOGO_PATH, width=130)
-    except: st.write("Logo Missing")
-with col_banner:
-    st.markdown('<div class="red-banner"><p class="banner-text">Colorado Gaming Regulatory Search</p></div>', unsafe_allow_html=True)
 
-# 2. Search Field Row
-col_in, col_btn = st.columns([0.85, 0.15])
-with col_in:
-    query = st.text_input("Search terms", label_visibility="collapsed", placeholder="Enter query (e.g. 'blackjack payout' or 'found money')")
-with col_btn:
-    search_clicked = st.button("SEARCH")
+def get_selected_visible_sources() -> Tuple[str, ...]:
+    selected = []
+    if st.session_state["source_amendment"]:
+        selected.append("Amendment 50 & CRS")
+    if st.session_state["source_clgr"]:
+        selected.append("CLGR")
+    if st.session_state["source_icmp"]:
+        selected.append("ICMP")
+    return tuple(selected)
 
-# 3. Source Selection Logic
-if 'all_checked' not in st.session_state: st.session_state.all_checked = True
 
-def handle_all_toggle():
-    st.session_state.src1 = st.session_state.all_val
-    st.session_state.src2 = st.session_state.all_val
-    st.session_state.src3 = st.session_state.all_val
+# =========================================================
+# STYLING
+# =========================================================
+def inject_css() -> None:
+    st.markdown(
+        f"""
+        <style>
+            .stApp {{
+                max-width: 1250px;
+                margin: 0 auto;
+                color: {TEXT};
+            }}
 
-st.write("**Sources:**")
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    all_cb = st.checkbox("All", value=st.session_state.all_checked, key="all_val", on_change=handle_all_toggle)
-with c2:
-    src1 = st.checkbox("Amendment 50 & CRS", value=st.session_state.all_checked, key="src1")
-with c3:
-    src2 = st.checkbox("CLGR", value=st.session_state.all_checked, key="src2")
-with c4:
-    src3 = st.checkbox("ICMP", value=st.session_state.all_checked, key="src3")
+            .banner {{
+                background-color: {RED};
+                color: white;
+                font-weight: 800;
+                font-size: 2rem;
+                text-align: center;
+                padding: 1rem 1.25rem;
+                border-radius: 0.5rem;
+                margin-top: 0.25rem;
+            }}
 
-# Aggregate selected filters
-active_filters = []
-if src1: active_filters.append("Amendment 50 & CRS")
-if src2: active_filters.append("CLGR")
-if src3: active_filters.append("ICMP")
-# Notification is always included as an embedded searchable file per instructions
-active_filters.append("Notification")
+            .search-label {{
+                font-weight: 700;
+                margin-bottom: 0.25rem;
+            }}
 
-# --- EXECUTION ---
-@st.cache_resource
-def init_engine():
-    engine = GamingSearchEngine()
-    engine.index_files()
-    return engine
+            .sources-label {{
+                font-weight: 700;
+                margin-top: 0.25rem;
+            }}
 
-engine = init_engine()
+            .summary-box {{
+                background: #FFF8F8;
+                border: 1px solid {LIGHT_RED};
+                border-left: 6px solid {RED};
+                border-radius: 0.5rem;
+                padding: 1rem 1rem 0.9rem 1rem;
+                margin-top: 1rem;
+                margin-bottom: 1rem;
+            }}
 
-if (search_clicked or query) and query:
-    if not any([src1, src2, src3]):
-        st.error("Please select a source to search.")
-    else:
-        with st.spinner("Indexing and searching official documents..."):
-            results = engine.search(query, active_filters)
-        
-        # A. Plain Language Summary
-        st.markdown("### 📝 Regulatory Summary")
-        if results:
-            found_sources = ", ".join(set([res['source'] for res in results]))
-            st.info(f"Your search for **'{query}'** yielded results in the following official sources: {found_sources}. "
-                    "Below are the specific, unedited citations including the exact legal text and direct links to the documents.")
-            
-            # B. Citations (Categorized)
-            st.markdown("### 📜 Official Citations")
-            for res in results:
-                with st.expander(f"Source: {res['source']} | Reference ID: {res['ref_id']}", expanded=True):
-                    # Unedited Text
-                    st.write(res['content'])
-                    # Base64 Link Button
-                    link_html = get_pdf_tab_link(res['path'], res['page'])
-                    st.markdown(link_html, unsafe_allow_html=True)
+            .results-box {{
+                background: white;
+                border: 1px solid {BORDER};
+                border-radius: 0.5rem;
+                padding: 1rem;
+                margin-bottom: 1rem;
+            }}
+
+            .citation-label {{
+                font-weight: 800;
+                color: {RED};
+                margin-bottom: 0.35rem;
+            }}
+
+            .small-note {{
+                color: #666;
+                font-size: 0.92rem;
+            }}
+
+            div.stButton > button {{
+                background-color: {RED};
+                color: white;
+                font-weight: 700;
+                border: none;
+                border-radius: 0.45rem;
+                min-height: 2.6rem;
+                width: 100%;
+            }}
+
+            div.stButton > button:hover {{
+                background-color: #8F1519;
+                color: white;
+            }}
+
+            .stCheckbox label {{
+                font-weight: 500;
+            }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# =========================================================
+# RENDER
+# =========================================================
+def render_header() -> None:
+    logo_col, banner_col = st.columns([1, 6])
+
+    with logo_col:
+        logo_path = IMAGE_DIR / LOGO_FILENAME
+        if logo_path.exists():
+            st.image(str(logo_path), use_container_width=True)
         else:
-            st.warning("No matching rules or regulations found in the embedded files. Please try broader keywords.")
+            st.write("")
+
+    with banner_col:
+        st.markdown(
+            '<div class="banner">Colorado Gaming Regulatory Search</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def render_search_controls() -> Tuple[bool, str]:
+    with st.form("search_form", clear_on_submit=False):
+        query_col, button_col = st.columns([5, 1])
+
+        with query_col:
+            user_query = st.text_input(
+                "Search",
+                label_visibility="collapsed",
+                placeholder="Enter search text",
+            )
+
+        with button_col:
+            submitted = st.form_submit_button("Search", use_container_width=True)
+
+    st.markdown('<div class="sources-label">Sources:</div>', unsafe_allow_html=True)
+
+    c1, c2, c3, c4 = st.columns([1, 1.4, 1, 1])
+
+    with c1:
+        st.checkbox(
+            "All",
+            key="all_sources",
+            on_change=sync_from_all,
+        )
+
+    with c2:
+        st.checkbox(
+            "Amendment 50 & CRS",
+            key="source_amendment",
+            on_change=sync_from_individuals,
+        )
+
+    with c3:
+        st.checkbox(
+            "CLGR",
+            key="source_clgr",
+            on_change=sync_from_individuals,
+        )
+
+    with c4:
+        st.checkbox(
+            "ICMP",
+            key="source_icmp",
+            on_change=sync_from_individuals,
+        )
+
+    st.markdown(
+        '<div class="small-note">Notification requirements are searched automatically for every query.</div>',
+        unsafe_allow_html=True,
+    )
+
+    return submitted, user_query
+
+
+def render_summary(summary_text: str) -> None:
+    st.markdown(
+        f"""
+        <div class="summary-box">
+            <div class="citation-label">Summary:</div>
+            <div>{html.escape(summary_text)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_citations(results: List[dict]) -> None:
+    st.markdown("### Citations")
+
+    for i, item in enumerate(results, start=1):
+        rec = item["record"]
+        link = pdf_link(rec.filename, rec.page_number)
+
+        st.markdown(
+            f"""
+            <div class="results-box">
+                <div class="citation-label">[{i}] {html.escape(rec.source_label)} — Page {rec.page_number}</div>
+                <div><a href="{link}" target="_blank">Open PDF to cited page</a></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # Citation text must not be paraphrased or interpreted.
+        st.code(item["snippet"], language=None)
+
+
+def render_no_results() -> None:
+    st.warning("No relevant matches were found in the selected sources.")
+
+
+def render_missing_files(missing_files: List[str]) -> None:
+    st.error("Missing required file(s):")
+    for f in missing_files:
+        st.write(f"- {f}")
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def main() -> None:
+    initialize_session_state()
+    ensure_static_assets()
+    inject_css()
+    render_header()
+
+    required_files = [
+        PDF_DIR / "updatedLGact.pdf",
+        PDF_DIR / "1CCR207-1CombinedRules31726.pdf",
+        PDF_DIR / "CombinedICMPEffectiveApril12C2026.pdf",
+        PDF_DIR / "NotificationRequirementsDocApril12026.pdf",
+        IMAGE_DIR / "DOGLogo.jpg",
+    ]
+
+    missing = [str(p.relative_to(APP_DIR)) for p in required_files if not p.exists()]
+    if missing:
+        render_missing_files(missing)
+        st.stop()
+
+    submitted, user_query = render_search_controls()
+
+    if submitted:
+        query = user_query.strip()
+        if not query:
+            st.warning("Please enter search text.")
+            st.stop()
+
+        selected_sources = get_selected_visible_sources()
+
+        # If user unchecks everything visible, still allow Notification doc to be searched
+        page_records = build_page_index(selected_sources)
+
+        if not page_records:
+            st.warning("No pages were indexed from the embedded PDF files.")
+            st.stop()
+
+        with st.spinner("Searching embedded PDF sources..."):
+            raw_results = search_pages(page_records, query, top_k=18)
+            results = dedupe_results(raw_results, max_per_source=5)
+
+        if not results:
+            render_no_results()
+            st.stop()
+
+        summary = build_plain_language_summary(results, query)
+        render_summary(summary)
+        render_citations(results)
+
+
+if __name__ == "__main__":
+    main()
