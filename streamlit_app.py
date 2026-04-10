@@ -641,7 +641,7 @@ def main() -> None:
     required_files = [
         PDF_DIR / "updatedLGact.pdf",
         PDF_DIR / "1CCR207-1CombinedRules31726.pdf",
-        PDF_DIR / "CombinedICMPEffectiveApril12C2026.pdf",
+        PDF_DIR / "CombinedICMPEffectiveApril12026.pdf",
         PDF_DIR / "NotificationRequirementsDocApril12026.pdf",
         IMAGE_DIR / "DOGLogo.jpg",
     ]
