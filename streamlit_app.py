@@ -47,7 +47,7 @@ VISIBLE_SOURCES: Dict[str, Dict[str, str]] = {
         "label": "CLGR",
     },
     "ICMP": {
-        "filename": "CombinedICMPEffectiveApril12C2026.pdf",
+        "filename": "CombinedICMPEffectiveApril12026.pdf",
         "label": "ICMP",
     },
 }
