@@ -18,11 +18,11 @@ from sklearn.metrics.pairwise import cosine_similarity
 # =========================================================
 APP_DIR = Path(__file__).resolve().parent
 PDF_DIR = APP_DIR / "PDFs"
-IMAGE_DIR = APP_DIR / "image"
+IMAGE_DIR = APP_DIR / "Image"
 
 STATIC_DIR = APP_DIR / "static"
 STATIC_PDF_DIR = STATIC_DIR / "PDFs"
-STATIC_IMAGE_DIR = STATIC_DIR / "image"
+STATIC_IMAGE_DIR = STATIC_DIR / "Image"
 
 # =========================================================
 # CONFIG
