@@ -1,4 +1,4 @@
 streamlit>=1.44
 pymupdf>=1.25
 scikit-learn>=1.5
-numpy>=1.26
+pandas>=2.2
