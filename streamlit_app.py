@@ -1,14 +1,16 @@
+from __future__ import annotations
+
 import html
 import re
 import shutil
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 from urllib.parse import quote
 
 import fitz  # PyMuPDF
-import numpy as np
+import pandas as pd
 import streamlit as st
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -18,11 +20,11 @@ from sklearn.metrics.pairwise import cosine_similarity
 # =========================================================
 APP_DIR = Path(__file__).resolve().parent
 PDF_DIR = APP_DIR / "PDFs"
-IMAGE_DIR = APP_DIR / "Image"
+IMAGE_DIR = APP_DIR / "image"
 
 STATIC_DIR = APP_DIR / "static"
 STATIC_PDF_DIR = STATIC_DIR / "PDFs"
-STATIC_IMAGE_DIR = STATIC_DIR / "Image"
+STATIC_IMAGE_DIR = STATIC_DIR / "image"
 
 # =========================================================
 # CONFIG
@@ -47,7 +49,7 @@ VISIBLE_SOURCES: Dict[str, Dict[str, str]] = {
         "label": "CLGR",
     },
     "ICMP": {
-        "filename": "CombinedICMPEffectiveApril12026.pdf",
+        "filename": "CombinedICMPEffectiveApril12C2026.pdf",
         "label": "ICMP",
     },
 }
@@ -68,14 +70,14 @@ class PageRecord:
     source_key: str
     source_label: str
     filename: str
-    page_number: int  # 1-based
+    page_number: int
     text: str
     normalized_text: str
     static_pdf_path: str
 
 
 # =========================================================
-# UTILS
+# UTILITIES
 # =========================================================
 def normalize_text(text: str) -> str:
     text = text.replace("\u00a0", " ")
@@ -99,7 +101,6 @@ def ensure_static_assets() -> None:
     STATIC_PDF_DIR.mkdir(parents=True, exist_ok=True)
     STATIC_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Copy PDFs to Streamlit static directory for clickable links
     for source in list(VISIBLE_SOURCES.values()) + [ALWAYS_INCLUDED_SOURCE]:
         src = PDF_DIR / source["filename"]
         dst = STATIC_PDF_DIR / source["filename"]
@@ -107,7 +108,6 @@ def ensure_static_assets() -> None:
             if not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime:
                 shutil.copy2(src, dst)
 
-    # Copy logo
     logo_src = IMAGE_DIR / LOGO_FILENAME
     logo_dst = STATIC_IMAGE_DIR / LOGO_FILENAME
     if logo_src.exists():
@@ -118,11 +118,6 @@ def ensure_static_assets() -> None:
 def pdf_link(filename: str, page_number: int) -> str:
     quoted_name = quote(filename)
     return f"app/static/PDFs/{quoted_name}#page={page_number}"
-
-
-def image_link(filename: str) -> str:
-    quoted_name = quote(filename)
-    return f"app/static/image/{quoted_name}"
 
 
 def count_keyword_hits(text: str, terms: List[str]) -> int:
@@ -146,13 +141,12 @@ def looks_like_heading_match(text: str, terms: List[str]) -> bool:
     if not terms:
         return False
 
-    # Look at the early lines/segments of the page where headings usually live
     segments = re.split(r"(?<=[.:])\s+|\n", text[:1500])
     early_segments = [seg.strip() for seg in segments[:10] if seg.strip()]
 
     for seg in early_segments:
         headingish = (
-            len(seg) <= 140
+            len(seg) <= 160
             and (
                 seg.isupper()
                 or bool(re.match(r"^(rule|section|article|part|purpose|definitions|internal control|notification)", seg, re.I))
@@ -164,7 +158,7 @@ def looks_like_heading_match(text: str, terms: List[str]) -> bool:
     return False
 
 
-def make_raw_snippet(page_text: str, query_terms: List[str], phrases: List[str], window: int = 500) -> str:
+def make_raw_snippet(page_text: str, query_terms: List[str], phrases: List[str], window: int = 700) -> str:
     search_items = [p for p in phrases if p] + [t for t in query_terms if t]
     lowered = page_text.lower()
 
@@ -195,6 +189,108 @@ def make_raw_snippet(page_text: str, query_terms: List[str], phrases: List[str],
     return snippet
 
 
+def escape_md(text: str) -> str:
+    return text.replace("|", "\\|")
+
+
+# =========================================================
+# REGULATION NUMBER EXTRACTION
+# =========================================================
+RULE_PATTERNS = [
+    r"\bRule\s+\d{1,2}-\d{3,5}(?:\s*\([^)]{1,20}\))*",
+    r"\b\d{1,2}-\d{3,5}(?:\s*\([^)]{1,20}\))*",
+    r"\bICMP\s+Section\s+\d+(?:\s*\([A-Za-z0-9]+\))*",
+    r"\bSection\s+\d+(?:\s*\([A-Za-z0-9]+\))*",
+    r"\bCRS\s+\d{1,3}-\d{1,3}-\d{1,5}(?:\.\d+)?(?:\s*\([^)]{1,20}\))*",
+    r"\bAmendment\s+50\b",
+    r"\bNotification\s+Table\b",
+]
+
+
+def extract_regulation_numbers(text: str, source_label: str) -> List[str]:
+    found = []
+
+    for pattern in RULE_PATTERNS:
+        matches = re.findall(pattern, text, flags=re.I)
+        for match in matches:
+            cleaned = normalize_text(match)
+            if cleaned:
+                found.append(cleaned)
+
+    # Special handling for notification doc if no formal number appears
+    if source_label == "Notification" and not found:
+        found.append("Notification Table")
+
+    # Deduplicate while preserving order
+    seen = set()
+    deduped = []
+    for item in found:
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(item)
+
+    return deduped[:5]
+
+
+# =========================================================
+# DESCRIPTION EXTRACTION
+# =========================================================
+def split_sentences(text: str) -> List[str]:
+    sentences = re.split(r"(?<=[.!?;])\s+", text)
+    return [normalize_text(s) for s in sentences if normalize_text(s)]
+
+
+def choose_best_description(snippet: str, raw_query: str) -> str:
+    query_terms = set(tokenize(raw_query))
+    sentences = split_sentences(snippet)
+
+    if not sentences:
+        return "Relevant language located in cited source."
+
+    scored = []
+    for sentence in sentences:
+        sentence_terms = set(tokenize(sentence))
+        overlap = len(query_terms.intersection(sentence_terms))
+        score = overlap
+
+        # small bonus for obligation language
+        lowered = sentence.lower()
+        if any(word in lowered for word in ["must", "shall", "required", "prohibited", "may not", "violation", "notification"]):
+            score += 2
+
+        scored.append((score, sentence))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best = scored[0][1]
+
+    if len(best) > 220:
+        best = best[:217].rstrip() + "..."
+
+    return best
+
+
+# =========================================================
+# THEMATIC GROUPING
+# =========================================================
+def classify_finding(snippet: str, query: str) -> str:
+    text = f"{query} {snippet}".lower()
+
+    if any(word in text for word in ["must", "shall", "required", "requirement", "mandate"]):
+        return "General Requirements"
+
+    if any(word in text for word in ["access", "secure", "safeguard", "storage", "escort", "surveillance", "unattended", "lock", "bankroll", "protection"]):
+        return "Operational / Physical Controls"
+
+    if any(word in text for word in ["notify", "notification", "24 hours", "report", "reported"]):
+        return "Reporting / Notification"
+
+    if any(word in text for word in ["violation", "penalty", "fine", "revocation", "unsuitable"]):
+        return "Consequences / Enforcement"
+
+    return "Relevant Findings"
+
+
 # =========================================================
 # PDF EXTRACTION
 # =========================================================
@@ -210,7 +306,6 @@ def extract_pages_from_pdf(pdf_path: str, source_key: str, source_label: str) ->
 
     with fitz.open(path) as doc:
         for i, page in enumerate(doc, start=1):
-            # sort=True gives a more natural reading order
             text = page.get_text("text", sort=True)
             text = normalize_text(text)
 
@@ -236,7 +331,6 @@ def extract_pages_from_pdf(pdf_path: str, source_key: str, source_label: str) ->
 def build_page_index(selected_visible_sources: Tuple[str, ...]) -> List[PageRecord]:
     records: List[PageRecord] = []
 
-    # Visible user-selected sources
     for source_name in selected_visible_sources:
         if source_name in VISIBLE_SOURCES:
             meta = VISIBLE_SOURCES[source_name]
@@ -249,7 +343,6 @@ def build_page_index(selected_visible_sources: Tuple[str, ...]) -> List[PageReco
                 )
             )
 
-    # Always include notification doc, regardless of source selection
     always_path = PDF_DIR / ALWAYS_INCLUDED_SOURCE["filename"]
     records.extend(
         extract_pages_from_pdf(
@@ -265,7 +358,7 @@ def build_page_index(selected_visible_sources: Tuple[str, ...]) -> List[PageReco
 # =========================================================
 # SEARCH / RANKING
 # =========================================================
-def search_pages(records: List[PageRecord], raw_query: str, top_k: int = 15) -> List[dict]:
+def search_pages(records: List[PageRecord], raw_query: str, top_k: int = 18) -> List[dict]:
     cleaned_query, quoted_phrases = parse_query(raw_query)
     query_terms = tokenize(cleaned_query)
 
@@ -317,16 +410,22 @@ def search_pages(records: List[PageRecord], raw_query: str, top_k: int = 15) -> 
         if final_score <= 0:
             continue
 
+        snippet = make_raw_snippet(text, query_terms, quoted_phrases)
+        regulations = extract_regulation_numbers(text, record.source_label)
+
         results.append(
             {
                 "record": record,
                 "score": float(final_score),
                 "tfidf_score": float(tfidf_scores[i]),
                 "keyword_hits": keyword_hits,
-                "snippet": make_raw_snippet(text, query_terms, quoted_phrases),
+                "snippet": snippet,
                 "all_terms_bonus": all_terms_bonus,
                 "exact_phrase_bonus": exact_phrase_bonus,
                 "heading_bonus": heading_bonus,
+                "regulations": regulations,
+                "description": choose_best_description(snippet, raw_query),
+                "category": classify_finding(snippet, raw_query),
             }
         )
 
@@ -334,7 +433,7 @@ def search_pages(records: List[PageRecord], raw_query: str, top_k: int = 15) -> 
     return results[:top_k]
 
 
-def dedupe_results(results: List[dict], max_per_source: int = 5) -> List[dict]:
+def dedupe_results(results: List[dict], max_per_source: int = 6) -> List[dict]:
     deduped = []
     seen_pages = set()
     per_source_counts: Dict[str, int] = {}
@@ -357,30 +456,116 @@ def dedupe_results(results: List[dict], max_per_source: int = 5) -> List[dict]:
 
 
 # =========================================================
-# SUMMARY
+# CITATION NUMBERING
 # =========================================================
-def build_plain_language_summary(results: List[dict], user_query: str) -> str:
+def assign_citation_numbers(results: List[dict]) -> List[dict]:
+    numbered = []
+    for i, item in enumerate(results, start=1):
+        new_item = dict(item)
+        new_item["citation_number"] = i
+        numbered.append(new_item)
+    return numbered
+
+
+def citation_range_text(nums: List[int]) -> str:
+    if not nums:
+        return ""
+    nums = sorted(set(nums))
+    ranges = []
+    start = nums[0]
+    prev = nums[0]
+
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+        else:
+            ranges.append(f"{start}-{prev}" if start != prev else f"{start}")
+            start = prev = n
+    ranges.append(f"{start}-{prev}" if start != prev else f"{start}")
+    return "[" + ", ".join(ranges) + "]"
+
+
+# =========================================================
+# SUMMARY GENERATION
+# =========================================================
+def build_structured_summary(results: List[dict], user_query: str) -> str:
     if not results:
         return "No relevant matches were found in the selected embedded PDF sources."
 
-    top_results = results[:5]
-    source_counts = Counter(item["record"].source_label for item in top_results)
-    source_summary = ", ".join(f"{src} ({count})" for src, count in source_counts.items())
+    grouped: Dict[str, List[dict]] = defaultdict(list)
+    for item in results[:8]:
+        grouped[item["category"]].append(item)
 
-    top_points = []
-    for item in top_results[:3]:
+    intro_sources = []
+    for item in results[:5]:
+        intro_sources.append(item["citation_number"])
+    intro_cites = citation_range_text(intro_sources)
+
+    lines = []
+    lines.append(f"### **Regulatory Summary: {user_query.strip()}**")
+    lines.append("")
+    lines.append(
+        f"Based on the selected Colorado gaming regulatory sources, the retrieved provisions indicate the following regarding **{user_query.strip()}** {intro_cites}."
+    )
+    lines.append("")
+
+    preferred_order = [
+        "General Requirements",
+        "Operational / Physical Controls",
+        "Reporting / Notification",
+        "Consequences / Enforcement",
+        "Relevant Findings",
+    ]
+
+    for category in preferred_order:
+        items = grouped.get(category, [])
+        if not items:
+            continue
+
+        lines.append(f"**{category}:**")
+        seen_desc = set()
+
+        for item in items[:3]:
+            desc = item["description"].strip()
+            if desc.lower() in seen_desc:
+                continue
+            seen_desc.add(desc.lower())
+            cite = citation_range_text([item["citation_number"]])
+            lines.append(f"- {desc} {cite}")
+
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+# =========================================================
+# ASSOCIATED CITED CONTENT TABLE
+# =========================================================
+def build_associated_cited_content(results: List[dict]) -> pd.DataFrame:
+    rows = []
+
+    for item in results:
         rec = item["record"]
-        top_points.append(
-            f"{rec.source_label} page {rec.page_number} contains language that appears relevant to the search."
+        regs = item["regulations"] if item["regulations"] else ["Not explicitly identified"]
+        reg_text = "; ".join(regs[:3])
+
+        rows.append(
+            {
+                "Regulation / ICMP Number": reg_text,
+                "Description": item["description"],
+                "Source Document Location": f"{rec.filename} - page {rec.page_number} [Citation {item['citation_number']}]",
+            }
         )
 
-    summary = (
-        f"Based on the selected Colorado Division of Gaming embedded PDF sources, "
-        f"the strongest matches for '{user_query}' appear in: {source_summary}. "
-        f"{' '.join(top_points)} "
-        f"Review the citation text below for the exact extracted language."
-    )
-    return summary
+    df = pd.DataFrame(rows)
+
+    # Deduplicate visually similar rows
+    if not df.empty:
+        df = df.drop_duplicates(
+            subset=["Regulation / ICMP Number", "Description", "Source Document Location"]
+        ).reset_index(drop=True)
+
+    return df
 
 
 # =========================================================
@@ -433,7 +618,7 @@ def inject_css() -> None:
         f"""
         <style>
             .stApp {{
-                max-width: 1250px;
+                max-width: 1280px;
                 margin: 0 auto;
                 color: {TEXT};
             }}
@@ -449,11 +634,6 @@ def inject_css() -> None:
                 margin-top: 0.25rem;
             }}
 
-            .search-label {{
-                font-weight: 700;
-                margin-bottom: 0.25rem;
-            }}
-
             .sources-label {{
                 font-weight: 700;
                 margin-top: 0.25rem;
@@ -464,7 +644,7 @@ def inject_css() -> None:
                 border: 1px solid {LIGHT_RED};
                 border-left: 6px solid {RED};
                 border-radius: 0.5rem;
-                padding: 1rem 1rem 0.9rem 1rem;
+                padding: 1rem;
                 margin-top: 1rem;
                 margin-bottom: 1rem;
             }}
@@ -474,7 +654,7 @@ def inject_css() -> None:
                 border: 1px solid {BORDER};
                 border-radius: 0.5rem;
                 padding: 1rem;
-                margin-bottom: 1rem;
+                margin-bottom: 0.75rem;
             }}
 
             .citation-label {{
@@ -506,6 +686,22 @@ def inject_css() -> None:
             .stCheckbox label {{
                 font-weight: 500;
             }}
+
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+            }}
+
+            th, td {{
+                border: 1px solid #DDD;
+                padding: 8px;
+                text-align: left;
+                vertical-align: top;
+            }}
+
+            th {{
+                background-color: #F7F7F7;
+            }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -522,8 +718,6 @@ def render_header() -> None:
         logo_path = IMAGE_DIR / LOGO_FILENAME
         if logo_path.exists():
             st.image(str(logo_path), use_container_width=True)
-        else:
-            st.write("")
 
     with banner_col:
         st.markdown(
@@ -548,35 +742,19 @@ def render_search_controls() -> Tuple[bool, str]:
 
     st.markdown('<div class="sources-label">Sources:</div>', unsafe_allow_html=True)
 
-    c1, c2, c3, c4 = st.columns([1, 1.4, 1, 1])
+    c1, c2, c3, c4 = st.columns([1, 1.5, 1, 1])
 
     with c1:
-        st.checkbox(
-            "All",
-            key="all_sources",
-            on_change=sync_from_all,
-        )
+        st.checkbox("All", key="all_sources", on_change=sync_from_all)
 
     with c2:
-        st.checkbox(
-            "Amendment 50 & CRS",
-            key="source_amendment",
-            on_change=sync_from_individuals,
-        )
+        st.checkbox("Amendment 50 & CRS", key="source_amendment", on_change=sync_from_individuals)
 
     with c3:
-        st.checkbox(
-            "CLGR",
-            key="source_clgr",
-            on_change=sync_from_individuals,
-        )
+        st.checkbox("CLGR", key="source_clgr", on_change=sync_from_individuals)
 
     with c4:
-        st.checkbox(
-            "ICMP",
-            key="source_icmp",
-            on_change=sync_from_individuals,
-        )
+        st.checkbox("ICMP", key="source_icmp", on_change=sync_from_individuals)
 
     st.markdown(
         '<div class="small-note">Notification requirements are searched automatically for every query.</div>',
@@ -586,36 +764,39 @@ def render_search_controls() -> Tuple[bool, str]:
     return submitted, user_query
 
 
-def render_summary(summary_text: str) -> None:
+def render_structured_summary(summary_markdown: str) -> None:
     st.markdown(
-        f"""
-        <div class="summary-box">
-            <div class="citation-label">Summary:</div>
-            <div>{html.escape(summary_text)}</div>
-        </div>
-        """,
+        f'<div class="summary-box">{summary_markdown}</div>',
         unsafe_allow_html=True,
     )
 
 
-def render_citations(results: List[dict]) -> None:
-    st.markdown("### Citations")
+def render_associated_cited_content(df: pd.DataFrame) -> None:
+    st.markdown("### **Associated Cited Content**")
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-    for i, item in enumerate(results, start=1):
+
+def render_exact_citation_text(results: List[dict]) -> None:
+    st.markdown("### **Exact Citation Text**")
+
+    for item in results:
         rec = item["record"]
+        number = item["citation_number"]
         link = pdf_link(rec.filename, rec.page_number)
+        regs = "; ".join(item["regulations"][:3]) if item["regulations"] else "Not explicitly identified"
 
         st.markdown(
             f"""
             <div class="results-box">
-                <div class="citation-label">[{i}] {html.escape(rec.source_label)} — Page {rec.page_number}</div>
+                <div class="citation-label">[{number}] {html.escape(rec.source_label)} — Page {rec.page_number}</div>
+                <div><strong>Regulation / ICMP Number:</strong> {html.escape(regs)}</div>
                 <div><a href="{link}" target="_blank">Open PDF to cited page</a></div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        # Citation text must not be paraphrased or interpreted.
+        # Raw citation text only
         st.code(item["snippet"], language=None)
 
 
@@ -641,7 +822,7 @@ def main() -> None:
     required_files = [
         PDF_DIR / "updatedLGact.pdf",
         PDF_DIR / "1CCR207-1CombinedRules31726.pdf",
-        PDF_DIR / "CombinedICMPEffectiveApril12026.pdf",
+        PDF_DIR / "CombinedICMPEffectiveApril12C2026.pdf",
         PDF_DIR / "NotificationRequirementsDocApril12026.pdf",
         IMAGE_DIR / "DOGLogo.jpg",
     ]
@@ -660,8 +841,6 @@ def main() -> None:
             st.stop()
 
         selected_sources = get_selected_visible_sources()
-
-        # If user unchecks everything visible, still allow Notification doc to be searched
         page_records = build_page_index(selected_sources)
 
         if not page_records:
@@ -669,16 +848,22 @@ def main() -> None:
             st.stop()
 
         with st.spinner("Searching embedded PDF sources..."):
-            raw_results = search_pages(page_records, query, top_k=18)
-            results = dedupe_results(raw_results, max_per_source=5)
+            raw_results = search_pages(page_records, query, top_k=20)
+            results = dedupe_results(raw_results, max_per_source=6)
+            results = assign_citation_numbers(results)
 
         if not results:
             render_no_results()
             st.stop()
 
-        summary = build_plain_language_summary(results, query)
-        render_summary(summary)
-        render_citations(results)
+        summary_markdown = build_structured_summary(results, query)
+        associated_df = build_associated_cited_content(results)
+
+        st.markdown(summary_markdown)
+        st.markdown("---")
+        render_associated_cited_content(associated_df)
+        st.markdown("---")
+        render_exact_citation_text(results)
 
 
 if __name__ == "__main__":
