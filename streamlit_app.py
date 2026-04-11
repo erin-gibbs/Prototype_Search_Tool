@@ -169,7 +169,7 @@ def discover_source_files() -> Dict[str, List[SourceFile]]:
                     filename=pdf.name,
                 )
             )
-        elif pdf.stem.lower().startswith("rules"):
+        elif pdf.stem.lower().startswith("rule"):
             clgr.append(
                 SourceFile(
                     source_group="CLGR",
