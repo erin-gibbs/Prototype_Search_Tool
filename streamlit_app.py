@@ -10,7 +10,6 @@ External
 Me
 
 Erin Gibbs
-1:53 PM (1 minute ago)
 to me
 
 from __future__ import annotations
