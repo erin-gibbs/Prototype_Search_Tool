@@ -866,7 +866,7 @@ def render_search_controls() -> Tuple[bool, str]:
         st.checkbox("ICMP", key="source_icmp", on_change=sync_from_individuals)
 
     st.markdown(
-        '<div class="small-note">NotificationRequirementsDocApril12026.pdf is searched automatically for every query.</div>',
+        '<div class="small-note">Notification Requirements are searched automatically for every query.</div>',
         unsafe_allow_html=True,
     )
 
